@@ -7,6 +7,9 @@ import sqlContext.implicits._
 import org.apache.spark.sql._
 import org.apache.spark.mllib.recommendation.{ALS, MatrixFactorizationModel, Rating}
 
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+
 // COMMAND ----------
 
 // MAGIC %md # Stark kafka
@@ -25,95 +28,82 @@ val streamingInputDF = sc.readStream
 
 // COMMAND ----------
 
-case class Movie(movieID: Int, title: String, genres: Seq[String])
-case class User(userID: Int, gender: String, age: Int, occupation: Int, zip: String)
-
-// COMMAND ----------
-
-// MAGIC %md # Parse Functions
-
-// COMMAND ----------
-
-def parseMovie(str: String): Movie = {
-  val fields = str.split(",")
-  assert(fields.size == 3)
-  Movie(fields(0).toInt, fields(1), Seq(fields(2)))
-}
-
-def parseUser(str: String): User = {
-  val fields = str.split(",")
-  assert(fields.size == 5)
-  User(fields(0).toInt, fields(1).toString, fields(2).toInt, fields(3).toInt, fields(4).toString)
-}
-
-def parseRating(str: String): Rating = {
-  val fields = str.split(",")
-  Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
-}
-
-
-// COMMAND ----------
-
 // MAGIC %md # Get Files
 
 // COMMAND ----------
 
-/*
-// OLD DATA
-val ratingsRDD = sc.textFile("/FileStore/tables/v1hi3t4p1499721624595/ratings.dat").map(parseRating)
-val usersDF = sc.textFile("/FileStore/tables/v1hi3t4p1499721624595/users.dat").map(parseUser).toDF()
-val moviesDF = sc.textFile("/FileStore/tables/v1hi3t4p1499721624595/movies.dat").map(parseMovie).toDF()
+val imdb_top_250 = sc.textFile("/FileStore/tables/dv8mi6s81500848697699/top250.txt").map {
+  line => 
+  val field = line.split("   ")
+  val getName = field(3).split("  ")
+  (getName(1).replaceAll("\\(.*\\)", ""))
+}
 
-val ratingsDF = ratingsRDD.toDF()
-*/
-val ratingsRDD = sc.textFile("/FileStore/tables/p4a8vu7p1500012182568/ratings.csv").map(parseRating)
-val moviesDF = sc.textFile("/FileStore/tables/p4a8vu7p1500012182568/movies.csv").map(parseMovie).toDF()
-val ratingsDF = ratingsRDD.toDF()
 
 // COMMAND ----------
 
-// MAGIC %md # View data in SQL
+var ratings = sc.textFile("/FileStore/tables/67pu5v311500838826920/ratings.csv").map {
+  line => 
+  val fields = line.split(",")
+  Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
+}
+val movies = sc.textFile("/FileStore/tables/ef24v7hz1500842282508/movies.csv").map {
+  line =>
+  val fields = line.split(",")
+  (fields(0).toInt, fields(1))
+}.collect.toMap
 
 // COMMAND ----------
 
-ratingsDF.createOrReplaceTempView("ratings")
-moviesDF.createOrReplaceTempView("movies")
-//usersDF.createOrReplaceTempView("users")
-
-//usersDF.printSchema()
-moviesDF.printSchema()
-ratingsDF.printSchema()
+import org.apache.spark.sql.functions.countDistinct
+ratings.toDF().agg(countDistinct("user"))
 
 // COMMAND ----------
 
-val results = sqlContext.sql(
-  """select movies.title, movierates.maxr, movierates.minr, movierates.cntu
-     from (SELECT ratings.product, max(ratings.rating) as maxr,
-     min(ratings.rating) as minr, count(distinct user) as cntu
-     FROM ratings group by ratings.product) movierates
-     join movies on movierates.product=movies.movieId
-     order by movierates.cntu desc""")
-results.show()
+val ratings_json = """{
+  "userID": 23,
+  "movieID": 45,
+  "rating": 3
+}"""
 
-// COMMAND ----------
+val newRating = scala.util.parsing.json.JSON.parseFull(ratings_json)
 
-val mostActiveUsersSchemaRDD = sqlContext.sql(
-  """SELECT ratings.user, count(*) as ct from ratings
-  group by ratings.user order by ct desc limit 10""")
+newRating match {    
+ case Some(m: Map[String, Double]) => {
+    val a = m("userID")
+    val b = m("movieID")
+    val c = m("rating")
+    val d = Rating(a.toInt.toInt, b.toInt, c)    
+    val out = sc.parallelize(Seq(d))
+    ratings = ratings.union(out)
+  }
+  case _ => println("Failed")
+}
 
-println(mostActiveUsersSchemaRDD.collect().mkString("\n"))
+ratings.toDF().createOrReplaceTempView("ratings")
 
-val results = sqlContext.sql(
-  """SELECT ratings.user, ratings.product,
-  ratings.rating, movies.title FROM ratings JOIN movies
-  ON movies.movieId=ratings.product
-  where ratings.user=4169 and ratings.rating > 4""")
+val result = sqlContext.sql(
+  """SELECT ratings.user, ratings.product, ratings.rating
+  FROM ratings
+  WHERE ratings.product == 45 AND ratings.user == 23""")
+result.show()
 
-results.show
+ratings
 
 // COMMAND ----------
 
 // MAGIC %md # Split for Tests and Training
+
+// COMMAND ----------
+
+val splits = ratings.randomSplit(Array(0.7, 0.2, 0.1), 0L)
+
+val trainingRatingsRDD = splits(0).cache()
+val testRatingsRDD = splits(1).cache()
+val validationRatingsRDD = splits(2).cache()
+
+//val numTraining = trainingRatingsRDD.count()
+//val numTest = testRatingsRDD.count()
 
 // COMMAND ----------
 
@@ -125,49 +115,59 @@ var bestValidationRmse = Double.MaxValue
 var bestRank = 0
 var bestLambda = -1.0
 var bestNumIter = -1
+val numValidation = validationRatingsRDD.count()
 
-def computeABE(model: MatrixFactorizationModel, data: RDD[Rating]) = {
-  val testUserProductRDD = testRatingsRDD.map {
-    case Rating(user, product, rating) => (user, product)
-  }
-  val predictionsForTestRDD = model.predict(testUserProductRDD)
-  val predictionsKeyedByUserProductRDD = predictionsForTestRDD.map{
-    case Rating(user, product, rating) => ((user, product), rating)
-  }
-  val testKeyedByUserProductRDD = testRatingsRDD.map{
-    case Rating(user, product, rating) => ((user, product), rating)
-  }
-  val testAndPredictionsJoinedRDD = testKeyedByUserProductRDD.join(predictionsKeyedByUserProductRDD)
-  val falsePositives = (
-    testAndPredictionsJoinedRDD.filter{
-      case ((user, product), (ratingT, ratingP)) => (ratingT <= 1 && ratingP >= 4)
-    })
-  val meanAbsoluteError = testAndPredictionsJoinedRDD.map {
-    case ((user, product), (testRating, predRating)) =>
-      val err = (testRating - predRating)
-      Math.abs(err)
-  }.mean()
-  meanAbsoluteError
+def computeRmse(model: MatrixFactorizationModel, data: RDD[Rating], n: Long): Double = {
+  val predictions: RDD[Rating] = model.predict(data.map(x => (x.user, x.product)))
+  val predictionsAndRatings = predictions.map(x => ((x.user, x.product), x.rating))
+    .join(data.map(x => ((x.user, x.product), x.rating)))
+    .values
+  math.sqrt(predictionsAndRatings.map(x => (x._1 - x._2)*(x._1 - x._2)).reduce(_ + _) / n)
 }
 
 // COMMAND ----------
 
-val splits = ratingsRDD.randomSplit(Array(0.7, 0.2, 0.1), 0L)
-
-val trainingRatingsRDD = splits(0).cache()
-val testRatingsRDD = splits(1).cache()
-val validationRatingsRDD = splits(2).cache()
-
-val numTraining = trainingRatingsRDD.count()
-val numTest = testRatingsRDD.count()
+val model = (new ALS().setRank(8).setIterations(10).setLambda(10.0).run(trainingRatingsRDD))
+val validationRmse = computeRmse(model, validationRatingsRDD, numValidation)
+// Rank = 20, iterations = 10, lambda = 0.01, error = 84
 
 // COMMAND ----------
 
-val model = (new ALS().setRank(20).setIterations(10).setLambda(0.01).run(trainingRatingsRDD))
+def recommend(userId:Int, numOfRecommendations:Int = 10) = {
+  val recommendations = model.recommendProducts(userId, numOfRecommendations)
+  val filterRecommendations = recommendations
+      .map(rating => (movies(rating.product)
+                        .replaceAll("\\(.*\\)", "")
+                        .replaceAll("\"","")))
+                        .toSeq
+  val jsonOut = compact(render(filterRecommendations))
+}
+
+/*
+val recommendations = model.recommendProducts(23, 20)
+val topRecsForUser = model.recommendProducts(111, 25)
+val recs = topRecsForUser.map(rating => 
+  (movies(rating.product).replaceAll("\\(.*\\)", "").replaceAll("\"",""))
+).toSeq//.foreach(println)
+val recsRDD = sc.parallelize(recs)
+*/
 
 // COMMAND ----------
 
-val validationABE = computeABE(model, validationRatingsRDD)
+val validationRmse = computeRmse(model, validationRatingsRDD, numValidation)
+//val numUsers = ratings.map(_.user).distinct().count()
+
+// COMMAND ----------
+
+val validationMBE = computeABE(model, validationRatingsRDD, testRatingsRDD)
+
+// COMMAND ----------
+
+
+
+// COMMAND ----------
+
+val myRatedMovieIds = 
 
 // COMMAND ----------
 
@@ -191,18 +191,27 @@ for (rank <- ranks; lambda <- lambdas; numIter <- numIters) {
 
 // COMMAND ----------
 
-val topRecsForUser = model.recommendProducts(1, 5)
-val movieTitles = moviesDF.rdd.map( x => (x.getInt(0), x.getString(1)) )
-val recs = topRecsForUser.map(rating => (rating.user, rating.product, rating.rating)).foreach(println)
+val topRecsForUser = model.recommendProducts(111, 25)
+val recs = topRecsForUser.map(rating => 
+  (movies(rating.product).replaceAll("\\(.*\\)", "").replaceAll("\"",""))
+).toSeq//.foreach(println)
+val recsRDD = sc.parallelize(recs)
 
 // COMMAND ----------
 
-topRecsForUser.take(1)
+
+
+compact(render(recs))
+
+// COMMAND ----------
+
+//topRecsForUser.take(1)
+moviesDF.take(1).map( x => (x.getInt(0), x.getString(1)) )
 
 // COMMAND ----------
 
 val topRecsForUser = model.recommendProducts(1, 5)
-//val movieTitles = moviesDF.rdd.map(array => (array(0), array(1))).collect()
+val movieTitles = moviesDF.rdd.map(array => (array(0), array(1))).collect()
 //val recs = topRecsForUser.map(rating => (movieTitles(rating.product), rating.rating)).foreach(println)
 
 // COMMAND ----------
@@ -276,7 +285,45 @@ movieIDAndAverages.toDF().createOrReplaceTempView("movieIDAndAverages")
 
 // COMMAND ----------
 
-val myRatedMovieIds = 
+def elicitateRatings(movies: Seq[(Int, String)]) = {
+    val prompt = "Please rate following movie (1-5(best), or 0 if not seen):"
+    println(prompt)
+    val ratings = movies.flatMap { x =>
+
+      var rating: Option[Rating] = None
+      var valid = false
+
+      while (!valid) {
+        print(x._2 + ": ")
+        try {
+          val r = Console.readInt
+          if (r < 0 || r > 5) {
+            println(prompt)
+          } else {
+            valid = true
+            if (r > 0) {
+              rating = Some(Rating(0, x._1, r))
+            }
+          }
+        } catch {
+          case e: Exception => println(prompt)
+        }
+      }
+
+      rating match {
+        case Some(r) => Iterator(r)
+        case None => Iterator.empty
+      }
+
+    } //end flatMap
+
+    if (ratings.isEmpty) {
+      sys.error("No rating provided")
+    } else {
+      ratings
+    }
+
+  }
 
 // COMMAND ----------
 
@@ -290,10 +337,9 @@ val mostRatedMovies = ratingsRDD.map(_.product)
                                 .map(_._1)
 
 val random = new Random(0)
-
-// COMMAND ----------
-
-
+val selectedMovies = mostRatedMovies.filter(x => random.nextDouble() < 0.2)
+                                    .map(x => (x, movies(x)))
+                                    .toSeq
 
 // COMMAND ----------
 
